@@ -90,3 +90,7 @@ unlinked_spec.ds
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
 example/ios/Flutter/flutter_export_environment.sh
 **/flutter/generated_plugin*
+
+# Swift Package Manager related
+.build/
+.swiftpm/
