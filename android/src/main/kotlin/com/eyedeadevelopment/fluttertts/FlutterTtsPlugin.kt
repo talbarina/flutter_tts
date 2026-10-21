@@ -29,6 +29,8 @@ import java.lang.reflect.Field
 import java.util.Locale
 import java.util.MissingResourceException
 import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 
 /** FlutterTtsPlugin  */
@@ -42,7 +44,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var awaitSynthCompletion = false
     private var synth = false
     private var context: Context? = null
+    @Volatile
     private var tts: TextToSpeech? = null
+    // Runs the slow engine queries off the main thread, in call order. On
+    // Android the main thread also draws Flutter's frames, and each of these
+    // queries is a cross-process call to the speech engine.
+    private var queryExecutor: ExecutorService? = null
     private val tag = "TTS"
     private val pendingMethodCalls = ArrayList<Runnable>()
     private val utterances = HashMap<String, String>()
@@ -70,6 +77,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         methodChannel = MethodChannel(messenger, "flutter_tts")
         methodChannel!!.setMethodCallHandler(this)
         handler = Handler(Looper.getMainLooper())
+        queryExecutor = Executors.newSingleThreadExecutor()
         bundle = Bundle()
         tts = TextToSpeech(context, onInitListenerWithoutCallback)
     }
@@ -82,6 +90,8 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         stop()
         tts!!.shutdown()
+        queryExecutor?.shutdown()
+        queryExecutor = null
         context = null
         methodChannel!!.setMethodCallHandler(null)
         methodChannel = null
@@ -407,14 +417,14 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
             "setLanguage" -> {
                 val language: String = call.arguments.toString()
-                setLanguage(language, result)
+                runOffMainThread(result) { setLanguage(language, it) }
             }
 
-            "getLanguages" -> getLanguages(result)
+            "getLanguages" -> runOffMainThread(result) { getLanguages(it) }
             "getVoices" -> getVoices(result)
             "getSpeechRateValidRange" -> getSpeechRateValidRange(result)
-            "getEngines" -> getEngines(result)
-            "getDefaultEngine" -> getDefaultEngine(result)
+            "getEngines" -> runOffMainThread(result) { getEngines(it) }
+            "getDefaultEngine" -> runOffMainThread(result) { getDefaultEngine(it) }
             "getDefaultVoice" -> getDefaultVoice(result)
             "setVoice" -> {
                 val voice: HashMap<String?, String>? = call.arguments()
@@ -457,6 +467,39 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             else -> result.notImplemented()
+        }
+    }
+
+    /**
+     * Runs [query] on the query thread and delivers its reply on the main
+     * thread, as Flutter requires. An exception is replied as an error, as
+     * the method channel does for a call handled on the main thread.
+     */
+    private fun runOffMainThread(result: Result, query: (Result) -> Unit) {
+        val mainThreadResult = object : Result {
+            override fun success(value: Any?) {
+                handler!!.post { result.success(value) }
+            }
+
+            override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                handler!!.post { result.error(errorCode, errorMessage, errorDetails) }
+            }
+
+            override fun notImplemented() {
+                handler!!.post { result.notImplemented() }
+            }
+        }
+        val executor = queryExecutor
+        if (executor == null || executor.isShutdown) {
+            query(result)
+            return
+        }
+        executor.execute {
+            try {
+                query(mainThreadResult)
+            } catch (e: Exception) {
+                mainThreadResult.error("error", e.message, null)
+            }
         }
     }
 
